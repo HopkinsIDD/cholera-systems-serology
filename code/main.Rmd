@@ -1,0 +1,1696 @@
+---
+title: 'A systems serology analysis of correlates of protection against cholera'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r packages and functions, warning = FALSE, message = FALSE}
+pacman::p_load('data.table', 'ggplot2', 'openxlsx', 'RColorBrewer', 'gee',
+               'ggfortify', 'kableExtra', 'caret', 'caTools', 'cowplot',
+               'ggeffects', 'lme4', 'glmpca', 'mdatools', 'dplyr', 'e1071',
+               'pzfx', 'stringr', 'ranger', 'party', 'permimp', 
+               'ROCR', 'pROC', 'cvAUC', 'SuperLearner', 'parallel',
+               'corrplot', 'ggcorrplot')
+
+source(here::here('code', 'utils.R'))
+```
+
+```{r settings}
+# set random seed
+set.seed(3504)
+
+# color palette
+pal <- brewer.pal(n = 3, name = 'Dark2')
+pal <- c(pal[1], pal[3], pal[2])
+```
+
+```{r systems serology data}
+# load systems serology data for household contacts
+dt_wide <- fread(here::here('data', 'household_contact_data_public.csv'))
+```
+
+# Main manuscript
+
+## Table 1. Characteristics of the household contacts of index cholera cases in Dhaka, Bangladesh
+
+```{r, warning = FALSE, message = FALSE}
+# summarize totals by group
+pchar <- copy(dt_wide)
+pchar[, stoolpos := ifelse(category1 == 'uninfected', FALSE, TRUE)]
+pchar <- melt(pchar, id.vars = c('sample', 'stoolpos'), 
+              measure.vars = c('sex', 'age_group', 'cholhist', 'cholmarker', 
+                               'case_antibiotics', 'relation', 'diarrhea_duration'))
+pchar[, N_total := sum(.N), by = c('variable')]
+pchar[, N_group := sum(.N), by = c('variable', 'value')]
+pchar[, Pct_group := round(N_group/N_total*100, 1)]
+
+# summarize totals by group and outcome
+pchar[, N_outcome := sum(.N), by = c('variable', 'value', 'stoolpos')]
+pchar[, Pct_outcome := round(N_outcome/N_group*100, 1)]
+
+# clean up
+pchar <- pchar[stoolpos == TRUE]
+pchar[, c('sample', 'stoolpos', 'N_total') := NULL]
+pchar <- unique(pchar)
+pchar[, variable := str_to_title(variable)]
+pchar[, variable := gsub('_', ' ', variable)]
+pchar[value == 1, value := 'Yes']
+pchar[value == 0, value := 'No']
+pchar[variable == 'Cholhist', variable := 'Self-reported history of cholera']
+pchar[variable == 'Cholmarker', variable := 'Vibriocidal titer >=320 upon enrollment']
+pchar[variable == 'Relation', variable := 'Relationship to index cholera case']
+pchar[variable == 'Case antibiotics', variable := 'Index cholera case received antibiotics']
+pchar[variable == 'Diarrhea duration', variable := 'Diarrhea duration in index case']
+pchar[variable == 'Sex', value := ifelse(value == 'Yes', 'Female', 'Male')]
+
+# manually set order
+pchar[, order := c(1,2,6,5,4,3,7,8,9,10,11,12,16,14,13,15,17,20,19,18)]
+setorderv(pchar, 'order')
+pchar[, order := NULL]
+
+# make a pretty table 
+setnames(pchar, c('Category', 'Group', 'N', '%', 'N', '%'))
+
+pchar %>%
+    # make table with informative title and headers
+    kable(escape = F, font = 12) %>%
+    # simple striped, bordered table
+    kable_styling(bootstrap_options = c('bordered', 'striped', 'condensed'), 
+                  position = 'left', full_width = FALSE) %>%
+    # rows are black
+    row_spec(1:nrow(pchar), color='black') %>%
+    # collapse rows
+    collapse_rows(columns = 1, valign = 'top') %>%
+    # add header
+    add_header_above(c(' ' = 2, 'Total' = 2, 'Infected' = 2))
+```
+
+```{r reshape data}
+# melt to long dataset
+idvars <- c('sample', 'hh', 'yoa', 'age_group', 'sex', 'Ogroup', 
+            'case_antibiotics', 'relation', 'cholhist', 'cholmarker', 'diarrhea_duration',
+            'vibogaw', 'category1', 'category2', 'category3')
+dt <- melt(dt_wide, id.vars = idvars,
+           measure.vars = names(dt_wide)[!(names(dt_wide) %in% idvars)])
+
+# add outcome column
+dt[, stoolneg := ifelse(category1=='uninfected', 1, 0)]
+
+# make a dataset with new vibriocidals as a variable, and use old vibriocidals in main analysis
+dt_newvib <- copy(dt)
+dt[variable == 'Ogvctiter2_new_titers', value := vibogaw]
+dt[variable == 'Ogvctiter2_new_titers', variable := 'vibogaw']
+```
+
+## Figure 1. Dynamics of functional antibody responses following V. cholerae infection
+
+Antibody-dependent complement deposition (ADCD), cellular phagocytosis (ADCP), and neutrophil phagocytosis (ADNP) in serum from 24 index cholera cases upon enrollment (i.e., Day 2 post presumed symptom onset) and days 7 and 30 post onset. Each point represents the geometric mean of complement deposition and phagocytic scores, respectively, across three replicates. Boxplots show 50% (median), 25%, and 75% quantiles; whiskers represent approximate 95% confidence intervals for comparing medians (McGill et al. (1978)).
+
+```{r fig1, fig.height = 3, fig.width = 8}
+# read in data from index cholera cases
+ind <- fread(here::here('data', 'index_cases_public.csv'))
+
+# plot
+plot_cases <- function(bio, ylab) {
+  ggplot(ind[biomarker == bio]) +
+    geom_boxplot(aes(x = variable, y = value), 
+                 # not showing outliers because we can see them in the points
+                 outlier.color = 'white') +
+    geom_jitter(aes(x = variable, y = value, color = variable), size = 1) +
+    scale_color_manual(values = pal) +
+    theme_classic() +
+    labs(x = NULL, y = ylab) +
+    scale_y_continuous(trans = 'log2') +
+    theme(legend.position = 'none') +
+    ggtitle(bio)
+}
+
+p1 <- plot_cases('ADCD', 'FITC (geometric mean)')
+p2 <- plot_cases('ADCP', 'Phagocytic score')
+p3 <- plot_cases('ADNP', 'Phagocytic score')
+
+cowplot::plot_grid(p1, p2, p3, nrow = 1)
+```
+
+## Figure 2. Risk of infection in household contacts of an index cholera case
+
+Odds ratio of becoming infected among household contacts of an index cholera case for every 2-fold increase in baseline (Day 2) antibody titers, after adjusting for age and household clustering. Mean and 95% confidence interval are shown for each biomarker analyzed independently. Arrows indicate where upper confidence interval extends beyond the graph. Isotype is indicated on the left and antigen on the right for binding antibody titers. Biomarkers for which logistic model fitted values were very close to 1 are excluded.
+
+```{r gee-stool-status, results = 'hide'}
+# transform biomarker
+dt_gee <- copy(dt)
+dt_gee[, value := scale(log(as.numeric(value), 2))]
+
+# drop biomakrers with fitting problems
+drop_vars <- c('IgG2OgOSP_Lx', 'IgG2InOSP_Lx', 'IgA2OgOSP_Lx', 'IgA2InOSP_Lx')
+dt_gee2 <- dt_gee[!variable %in% drop_vars]
+
+# get odds ratios for group 1, ranked all biomarkers
+dt_or <- odds_ratio_table(dt_gee2, outcome_group = 1, 
+                          ranked = TRUE, model_type = 'gee',
+                          formatted_values_only = FALSE)
+
+# some useful labels
+dt_or$isotype <- sapply(dt_or$biomarker, get_isotype)
+dt_or$antigen <- sapply(dt_or$biomarker, get_antigen)
+
+# biomarkers with "significant" differences to label
+stoolpos_label <- as.character(dt_or[p==0, biomarker])
+```
+
+```{r fig2, fig.height = 9, fig.width = 6, warning = FALSE}
+# drop biomarkers with fitting problems
+message('Dropped the following vars with logistic model fitted values very close to 1:')
+message(paste0(drop_vars, '\n'))
+
+# order the antigens for grouping
+dt_or[, antigen := factor(antigen, levels = c('Functional responses', 
+                                              'CtxB', 'CT-HT', 'TcpA', 
+                                              'Sialidase', 'Ogawa-OSP', 'Inaba-OSP'))]
+setorderv(dt_or, 'antigen')
+dt_or[, id := .I]
+
+# set labels for the grouping variables
+antigen_labs <- c('Functional\nresponses', 'CtxB', 'CT-HT', 'TcpA', 
+                  'Sialidase', 'Ogawa-OSP', 'Inaba-OSP')
+names(antigen_labs) <- c('Functional responses', 
+                         'CtxB', 'CT-HT', 'TcpA', 
+                         'Sialidase', 'Ogawa-OSP', 'Inaba-OSP')
+
+# plotting function
+or_plot <- function(plot_dt, group_labs, xlim) {
+  
+  # add a flag for error bars that are outside of plotting area
+  plot_dt[OR_upper > xlim, add_arrow := 1]
+  plot_dt[OR_upper > xlim, OR_upper := xlim]
+
+  # make forest plot
+  ggplot(plot_dt, aes(y = id, x = OR_mean, xmin = OR_lower, xmax = OR_upper)) +
+    geom_point() +
+    geom_errorbarh(height = 0.1) +
+    scale_x_continuous(limits = c(0, xlim), breaks = c(0:xlim), name = 'Odds Ratio') +
+    scale_y_continuous(name = '', breaks = 1:length(plot_dt$isotype), 
+                       labels = plot_dt$isotype, trans = 'reverse') +
+    geom_vline(xintercept=1, color = 'black', linetype = 'dashed', alpha = 0.5) +
+    facet_grid(antigen~., scales = 'free', space = 'free',
+               labeller = labeller(antigen = group_labs)) +
+    theme_minimal() +
+    theme(panel.spacing = unit(1, 'lines')) +
+    # add arrow for those that excede 2.5
+    geom_segment(aes(x = xlim, xend = xlim, y = id, yend = id*add_arrow), 
+                 arrow = arrow(length = unit(0.15,'cm'), angle = 140)) +
+    # rotate labels
+    theme(strip.text.y = element_text(angle = 0))
+}
+
+# make plot
+or_plot(dt_or, antigen_labs, xlim = 2.5)
+```
+
+## Figure 3. Biomarkers important for classifying household contacts by infection outcome
+
+Top 15 biomarkers important in classifying household contacts of index cholera cases as infected (i.e., becoming stool positive) vs. uninfected (i.e., remaining stool negative). Biomarkers are ranked by importance scores calculated using conditional random forest classification models.
+
+```{r}
+# data
+rf_dt <- dcast(dt, sample + stoolneg + yoa ~ variable, value.var = 'value')
+rf_dt[, outcome := stoolneg]
+rf_dt <- na.omit(rf_dt[, -c(1:2)])
+```
+
+```{r fig3, warning = FALSE, fig.width = 6, fig.height = 4}
+# run with conditional random forest
+run_rf_analysis(rf_dt,
+                select_method = 'crf',
+                num_top_markers = 15,
+                print_rank_table = FALSE)
+```
+
+## Figure 4. Predicting infection outcome among household contacts using different subsets of biomarkers
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying household contacts of index cholera cases that remain uninfected vs. become infected using random forest models with different subsets of biomarkers and age. "5 biomarkers" corresponds to five of the top biomarkers selected via conditional importance, including ADCD, CtxB IgM, TcpA IgG2, Ogawa-OSP IgG1, and Sialidase IgG1. True and false positive rates calculated using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  original_res <- lapply(list('IgAtotalTcpA_Lx', 'top5', 'IgMtotalCtxB_Lx',
+                              'vibogaw', 'ADCD', 'all', 'IgG1OgOSP_Lx'),
+                         loo_crf,
+                         indat = dt,
+                         outcome_name = 'stoolneg',
+                         include_age = TRUE)
+  
+  original_res <- rbindlist(original_res, use.names = TRUE)
+  
+  # save results
+  write.csv(original_res, here::here('cv_results/public_stoolneg_cv_20211229.csv'))
+} else {
+  
+  # load saved results
+  original_res <- fread(here::here('cv_results/public_stoolneg_cv_20211229.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       all_correct = 0,
+                       npv = 0,
+                       ppv = 0,
+                       outcome_name = NA)
+
+# ids for actual outcomes
+stoolpos_ids <- dt_wide[category1!='uninfected', sample]
+stoolneg_ids <- dt_wide[category1=='uninfected', sample]
+
+# loop over models we ran
+for (i in unique(original_res$biomarkers)) {
+  # subset to model
+  model_res <- original_res[biomarkers==i]
+  # get porportion of the samples that were correctly classified
+  tmp <- model_res[sample %in% stoolpos_ids]
+  stlpos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  tmp <- model_res[sample %in% stoolneg_ids]
+  stlneg <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<30, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               npv = stlpos,
+                               ppv = stlneg,
+                               outcome_name = 'Uninfected vs. Infected'))
+}
+
+# clean up for plotting
+markers <- c('all', 'top5', 'ADCD', 'IgAtotalTcpA_Lx', 
+             'IgG1OgOSP_Lx', 'IgMtotalCtxB_Lx', 'vibogaw')
+marker_labels <- c('All biomarkers', '5 biomarkers', 'ADCD', 'TcpA IgA', 
+                   'Ogawa-OSP IgG1', 'CtxB IgM', 'Vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+```
+
+```{r fig4, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.75, 0.3),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))  -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+```{r}
+# save "best" model results to a table
+best_mods <- res_vals[model=='5 biomarkers']
+```
+
+```{r}
+# ppv and npv table with numbers
+pp <- unique(res_vals[, c('outcome_name',  'model', 'ppv', 'npv', 'all_correct',
+                          'auc', 'auc_lower', 'auc_upper')])
+```
+
+## Table 2. Characteristics of North American volunteers vaccinated and then challenged with V. cholerae
+
+```{r, warning = FALSE, message = FALSE}
+# load clean vaccinee data
+pv <- fread(here::here('data', 'vaccinee_data_public.csv'))
+```
+
+```{r, warning = FALSE, message = FALSE}
+# create a participant table
+ptab <- unique(pv[, c('group', 'sample', 'age', 'sex', 'challenge', 'outcome')])
+ptab <- ptab[group=='Vaccinee']
+# add age groups
+ptab[age >= 18, age_group := '18-25']
+ptab[age > 25, age_group := '26-35']
+ptab[age > 35, age_group := '36-45']
+# melt
+ptab <- melt(ptab, id.vars = c('sample', 'outcome'), 
+             measure.vars = c('challenge', 'age_group', 'sex'),
+             variable.name = 'Characteristic', 
+             value.name = 'Category')
+ptab[, N := length(sample), by = c('Characteristic', 'Category')]
+# no diarrhea
+ptab[, N_protected := sum(outcome=='No Qualifying Diarrhea'), by = c('Characteristic', 'Category')]
+ptab[, `No qualifying diarrhea` := paste0(N_protected, ' (', round(N_protected/N*100,1), '%)')]
+# mild
+ptab[, N_mild := sum(outcome=='Mild'), by = c('Characteristic', 'Category')]
+ptab[, Mild := paste0(N_mild, ' (', round(N_mild/N*100,1), '%)')]
+# moderate
+ptab[, N_mod := sum(outcome=='Moderate'), by = c('Characteristic', 'Category')]
+ptab[, Moderate := paste0(N_mod, ' (', round(N_mod/N*100,1), '%)')]
+# severe
+ptab[, N_sev := sum(outcome=='Severe'), by = c('Characteristic', 'Category')]
+ptab[, Severe := paste0(N_sev, ' (', round(N_sev/N*100,1), '%)')]
+# clean up
+ptab[, c('sample', 'outcome', 'N_protected', 'N_mild', 'N_mod', 'N_sev') := NULL]
+ptab <- unique(ptab)
+setorderv(ptab, c('Characteristic', 'Category'))
+ptab[, Characteristic := str_to_title(Characteristic)]
+ptab[, Characteristic := gsub('_', ' ', Characteristic)]
+
+# make pretty table
+ptab %>%
+    # make table with informative title and headers
+    kable(escape = F, font = 12) %>%
+    # simple striped, bordered table
+    kable_styling(bootstrap_options = c('bordered', 'striped', 'condensed'), 
+                  position = 'left', full_width = FALSE) %>%
+    # rows are black
+    row_spec(1:nrow(ptab), color='black') %>%
+    # collapse rows
+    collapse_rows(columns = 1, valign = 'top')
+```
+
+## Figure 5. Biomarkers important for classifying vaccinees by whether or not they developed diarrhea following V. cholerae challenge
+
+Top 15 biomarkers important in classifying vaccinees by developing either no qualifying diarrhea or mild to severe diarrhea following V. cholerae challenge. Biomarkers were selected using serum collected from participants on the day of challenge. Biomarkers are ranked by importance scores calculated using conditional random forest classification models.
+
+```{r}
+# add outcome
+pv[, outcome := ifelse(outcome == 'No Qualifying Diarrhea', 1, 0)]
+
+# day of challenge
+pv_dchal <- pv[group == 'Vaccinee' & day == paste0('D', challenge)]
+
+# call sample column sample
+setnames(pv_dchal, 'sample', 'sample')
+```
+
+```{r fig5, fig.width = 6, fig.height = 4}
+# data
+rf_pv <- dcast(pv_dchal, sample + outcome ~ variable, value.var = 'value')
+rf_pv <- na.omit(rf_pv[, -c('sample')])
+
+# run with conditional random forest
+run_rf_analysis(rf_pv,
+                select_method = 'crf',
+                num_top_markers = 15,
+                print_rank_table = FALSE)
+```
+
+## Figure 6. Predicting whether or not vaccinees develop diarrhea using different subsets of biomarkers
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying vaccinees that develop diarrhea vs. those that do not using random forest models with different subsets of biomarkers and age. "5 biomarkers" corresponds to five of the top biomarkers selected via conditional importance, including CT-HT IgA, CtxB IgA, CT-HT IgA2, TcpA IgA, and Sialidase IgA2. True and false positive rates calcualted using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r day-challenge-roc, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  pv_res <- lapply(list('all', 'top5', 'IgA_rCtxB', 'ADCD', 'IgA2_CTHT',
+                        'IgA_TcpA', 'vibinab', 'IgG3_InabaOSPBSA'),
+                   loo_crf,
+                   indat = pv_dchal,
+                   outcome_name = 'outcome',
+                   include_age = TRUE)
+  
+  pv_res <- rbindlist(pv_res, use.names = TRUE)
+  
+  # save results
+  write.csv(pv_res, here::here('cv_results/public_pv_dchal_cv_wts_results_20211229.csv'))
+  
+} else {
+  
+  # load saved results
+  pv_res <- fread(here::here('cv_results/public_pv_dchal_cv_wts_results_20211229.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       npv = 0,
+                       ppv = 0,
+                       all_correct = 0,
+                       outcome_name = NA)
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_dchal[outcome==0, sample])
+dianeg_ids <- unique(pv_dchal[outcome==1, sample])
+
+# loop over models we ran
+for (i in unique(pv_res$biomarkers)) {
+  # subset to model
+  model_res <- pv_res[biomarkers==i]
+  # get porportion of the individuals correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  tmp <- model_res[sample %in% dianeg_ids]
+  dianeg <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               npv = diapos,
+                               ppv = dianeg,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day of challenge'))
+}
+
+# clean up for plotting
+markers <- c('all', 'top5', 'ADCD', 'IgA_TcpA', 
+             'IgA2_CTHT', 'IgA_rCtxB', 'vibinab')
+marker_labels <- c('All biomarkers', '5 biomarkers', 'ADCD', 'TcpA IgA', 
+                   'CT-HT IgA2', 'CtxB IgA', 'Vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+```
+
+```{r fig6, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.75, 0.3),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+```{r}
+# save "best" model to a table
+best_mods <- rbind(best_mods, res_vals[model=='5 biomarkers'])
+```
+
+```{r}
+# ppv and npv table with numbers
+pp <- unique(res_vals[, c('outcome_name',  'model', 'ppv', 'npv',
+                          'auc', 'auc_lower', 'auc_upper')])
+```
+
+# Supplementary materials
+
+## Figure S1. Antibody titers upon enrollment among household contacts of index cholera cases
+
+Functional and antigen-isotype-specific binding antibody responses among household contacts in the case-ascertainment studies that remained uninfected (green), that became infected but didn't develop symptoms (purple), and that became infected and developed symptoms (red). Each point represents the geometric mean of antibody titers across 2-3 replicates for each contact upon enrollment (Day 2). Boxplots show 50% (median), 25%, and 75% quantiles; whiskers represent approximate 95% confidence intervals for comparing medians (McGill et al. (1978)). Pink * indicates differences between infected and uninfected were significant after adjusting for age and household clustering (also see Figure 2). Pink ^ indicates differences between infected contacts that developed symptoms and that remained asymptomatic were significant after adjusting for age and household clustering (also see Figure S2).
+
+```{r gee-symptoms, results = 'hide'}
+# drop biomakrers with fitting problems
+drop_vars_sp <- c('IgGtotalInOSP_Lx', 'IgG1InOSP_Lx', 'IgG2TcpA_Lx', 'IgG2OgOSP_Lx', 
+               'IgG2InOSP_Lx', 'IgG4InOSP_Lx', 'IgAtotalInOSP_Lx', 'IgA1InOSP_Lx', 
+               'IgA2TcpA_Lx', 'IgA2OgOSP_Lx', 'IgA2InOSP_Lx')
+dt_gee_sp <- dt_gee[!variable %in% drop_vars_sp]
+
+# get odds ratios for group 2, ranked all biomarkers
+dt_or_sp <- odds_ratio_table(dt_gee_sp, outcome_group = 2, 
+                             ranked = TRUE, model_type = 'gee',
+                             formatted_values_only = FALSE)
+
+# some useful labels
+dt_or_sp$isotype <- sapply(dt_or_sp$biomarker, get_isotype)
+dt_or_sp$antigen <- sapply(dt_or_sp$biomarker, get_antigen)
+
+# biomarkers with "significant" differences to label
+symptoms_label <- as.character(dt_or_sp[p==0, biomarker])
+```
+
+```{r distributions}
+# prep plotting dt
+plot_dt <- copy(dt)
+plot_dt[category1 == 'uninfected', category1 := 'uninfected']
+plot_dt[, outcome := factor(category1, levels = c('uninfected', 'asymptomatic', 'symptomatic'))]
+plot_dt[, variable := as.character(variable)]
+
+# some useful labels
+plot_dt$isotype <- sapply(plot_dt$variable, get_isotype)
+plot_dt$antigen <- sapply(plot_dt$variable, get_antigen)
+
+# labels for GEE significance
+plot_dt[, symptoms_label := ifelse(variable %in% stoolpos_label & variable %in% symptoms_label, '*^',
+                                   ifelse (variable %in% stoolpos_label, '* ',
+                                           ifelse(variable %in% symptoms_label, ' ^', '  ')))]
+
+# function to make plot
+plot_ab_distr <- function(group, plot_dt) {
+  
+  # subset
+  plot_ag <- plot_dt[antigen == group]
+  
+  # set order
+  plot_ag[, isotype := factor(isotype, levels = unique(plot_ag$isotype))]
+  
+  # annotations
+  sig_lab <- unique(plot_ag[, c('isotype', 'symptoms_label')])
+  
+  # plot
+  ab_plot <- ggplot(plot_ag) +
+        geom_boxplot(aes(x = outcome, y = value),
+                         # not showing outliers because we can see them in the points
+                         outlier.color = 'white') +
+        geom_jitter(aes(x = outcome, y = value, color = outcome), 
+                    size = 0.3, alpha = 0.5) +
+        scale_color_manual(values = pal) +
+        facet_wrap('isotype', scales = 'free_y', ncol = 5) +
+        theme_classic() + ylab('') + xlab('') +
+        scale_y_continuous(trans = 'log2') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              axis.text.y = element_text(size = 6),
+              legend.position = 'none') +
+        ggtitle(group) +
+        geom_text(size = 8, color = 'deeppink1', data = sig_lab,
+                  mapping = aes(x = Inf, y = Inf, label = symptoms_label),
+                  hjust   = 1.2, vjust   = 1.2)
+  
+  # end function
+  return(ab_plot)
+}
+```
+
+```{r figS1-func, fig.width = 8, fig.height = 3, warning = FALSE}
+plot_ab_distr('Functional responses', plot_dt)
+```
+
+```{r figS1-bind, fig.width = 8, fig.height = 4.5, warning = FALSE, message = FALSE}
+for (i in c('CtxB', 'CT-HT', 'TcpA', 'Sialidase', 'Ogawa-OSP', 'Inaba-OSP')) {
+  print(plot_ab_distr(i, plot_dt))
+}
+```
+
+## Figure S2. Risk of developing symptoms among infected household contacts
+
+Odds ratio of symptoms among infected household contacts (n=77) for every 2-fold increase in baseline (Day 2) antibody titers, after adjusting for age and household clustering. Mean and 95% confidence interval are shown for each biomarker analyzed independently. Arrows indicate where upper confidence interval extends beyond the graph. Isotype is indicated on the left and antigen on the right for binding antibody titers. Biomarkers for which logistic model fitted values were very close to 1 are excluded.
+
+```{r figS2, fig.height = 9, fig.width = 6, warning = FALSE}
+message('Dropped the following vars with logistic model fitted values very close to 1:')
+message(paste0(drop_vars_sp, '\n'))
+
+# order the antigens for grouping
+dt_or_sp[, antigen := factor(antigen, levels = c('Functional responses', 
+                                              'CtxB', 'CT-HT', 'TcpA', 
+                                              'Sialidase', 'Ogawa-OSP', 'Inaba-OSP'))]
+setorderv(dt_or_sp, 'antigen')
+dt_or_sp[, id := .I]
+
+# make plot
+or_plot(dt_or_sp, antigen_labs, xlim = 7)
+```
+
+## Figure S3. Unsupervised analysis of biomarkers in household contacts of index cholera cases upon enrollment
+
+Generalized principal components analysis (GLM-PCA) plot for dimension reduction of the antibody responses in household contacts of index cholera cases upon enrollment (Day 2) (Townes et al. 2019). The first two components are shown, labelled by individual outcome.
+
+```{r figS3, fig.width = 6, fig.height = 4, warning = FALSE}
+# color palette for PCA
+pal <- brewer.pal(n = 3, name = 'Set2')
+pal <- c(pal[1], pal[3], pal[2])
+
+# dataset
+dt_pca <- dcast(dt, sample + category1 ~ variable, value.var = 'value')
+
+# catgory labels
+cats <- as.factor(ifelse(dt_pca$category1=='uninfected', 'uninfected', 
+                         ifelse(dt_pca$category1=='symptomatic', 'infected: symptomatic',
+                                'infected: asymptomatic')))
+cats <- factor(cats, levels = c('uninfected', 
+                                'infected: asymptomatic', 
+                                'infected: symptomatic'))
+
+# plot PCA for original
+plot_glmpca(dt_pca[, -c(1:2)], cat = cats, color_vals = pal) 
+```
+
+## Figure S4. Pair-wise correlations between biomarkers in household contacts
+
+Pair-wise Spearman rho coefficients for serum biomarkers among household contacts of cholera cases upon enrollment. Significant (p < 0.05) correlations are shown by an open box and non-significant correlations are marked with an X.
+
+```{r figS4, fig.width = 9, fig.height = 8}
+cor_plot <- run_corr_analysis(dt_pca[, -c('sample', 'category1')])
+print(cor_plot)
+```
+
+```{r, fig.width = 6, fig.height = 4, warning = FALSE, eval = FALSE}
+# plot PCA for original
+plot_glmpca(dt_pca[, c('ADCD', 'IgMtotalCtxB_Lx', 'IgG1CTHolo_Lx', 'IgG1OgOSP_Lx', 'IgG2TcpA_Lx')], 
+            cat = cats, color_vals = pal) 
+```
+
+## Figure S5. Predicting whether or not household contacts remain uninfected using an ensemble of machine learning models
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying household contacts of index cholera cases that remain uninfected vs. become infected using an ensemble of three machine-learning models: random forest, penalized logistic regression, and support vector machine. Models were run with different subsets of biomarkers and age. "5 biomarkers" corresponds to five of the top biomarkers selected via conditional importance, including ADCD, CtxB IgM, CT-HT IgG1, Ogawa-OSP IgG1, TcpA IgG2. True and false positive rates calculated using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates.
+
+```{r, message = FALSE, warning = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # make sure we have seed set up for parallel processing
+  RNGkind("L'Ecuyer-CMRG")
+  set.seed(3405)
+  # run analysis for each different set of biomarkers
+  original_res <- mclapply(list('IgAtotalTcpA_Lx', 'top5', 'IgMtotalCtxB_Lx',
+                              'vibogaw', 'ADCD', 'all', 'IgG1OgOSP_Lx'),
+                         loo_ensemble,
+                         data = dt,
+                         outcome_name = 'stoolneg',
+                         include_age = TRUE,
+                         mc.cores = 7)
+  
+  original_res <- rbindlist(original_res, use.names = TRUE)
+  
+  # save results
+  write.csv(original_res, here::here('cv_results/public_stoolneg_cv_ensemble_20220119.csv'))
+} else {
+  
+  # load saved results
+  original_res <- fread(here::here('cv_results/public_stoolneg_cv_ensemble_20220119.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       all_correct = 0,
+                       npv = 0,
+                       outcome_name = NA)
+
+# ids for infected samples
+stoolpos_ids <- dt_wide[category1!='uninfected', sample]
+
+# loop over models we ran
+for (i in unique(original_res$biomarkers)) {
+  # subset to model
+  model_res <- original_res[biomarkers==i]
+  # get porportion of the known samples (infected) that were correctly classified
+  tmp <- model_res[sample %in% stoolpos_ids]
+  stlpos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<30, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               npv = stlpos,
+                               outcome_name = 'uninfected vs. infected'))
+}
+
+# clean up for plotting
+markers <- c('all', 'top5', 'ADCD', 'IgAtotalTcpA_Lx', 
+             'IgG1OgOSP_Lx', 'IgMtotalCtxB_Lx', 'vibogaw')
+marker_labels <- c('All biomarkers', '5 biomarkers', 'ADCD', 'TcpA IgA', 
+                   'Ogawa-OSP IgG1', 'CtxB IgM', 'Vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+```
+
+```{r figS5, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.75, 0.3),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+## Figure S6. Unsupervised analysis of biomarkers in vaccinees upon V. cholerae challenge
+
+Generalized principal components analysis (GLM-PCA) plot for dimension reduction of the antibody responses in volunteers that received a live attenuated oral cholera vaccine immediated prior to challenge with V. cholerae (Townes et al. 2019). The first two components are shown, labelled by individual outcome. Results are shown for antibody responses on the day of challenge.
+
+```{r figS6, fig.width = 6, fig.height = 4, warning = FALSE}
+# Day of challenge dataset
+dt_pca <- dcast(pv_dchal, sample + outcome ~ variable, value.var = 'value')
+# catgory labels
+cats <- as.factor(ifelse(dt_pca$outcome==1, 'No qualifying diarrhea', 'Diarrhea'))
+# plot PCA for original
+plot_glmpca(dt_pca[, -c(1:2)], cat = cats, color_vals = c(pal[3], pal[2]))
+```
+
+## Figure S7. Pair-wise correlations between biomarkers in vaccinees
+
+Pair-wise Spearman rho coefficients for serum biomarkers among vaccinees immediately prior to V. cholerae challenge. Significant (p < 0.05) correlations are shown by an open box and non-significant correlations are marked with an X.
+
+```{r figS7, fig.width = 9, fig.height = 8}
+cor_plot <- run_corr_analysis(dt_pca[, -c('sample', 'outcome')])
+print(cor_plot)
+```
+
+## Figure S8. Biomarkers important for classifying household contacts ages 18-48 by infection outcome
+
+Top 15 biomarkers important in classifying household contacts aged 18-48 years old as infected (i.e., becoming stool positive) vs. uninfected (i.e., remaining stool negative). Biomarkers are ranked by importance scores calculated using conditional random forest classification models.
+
+```{r}
+# data
+rf_dt <- dcast(dt[yoa>=18 & yoa <=48], sample + stoolneg + yoa ~ variable, value.var = 'value')
+rf_dt[, outcome := stoolneg]
+rf_dt <- na.omit(rf_dt[, -c(1:2)])
+```
+
+```{r figS8, fig.width = 6, fig.height = 4}
+# run with conditional random forest
+run_rf_analysis(rf_dt,
+                select_method = 'crf',
+                num_top_markers = 15)
+```
+
+## Figure S9. Biomarkers important for classifying vaccinees by outcome following challenge on either day 10 or day 90
+
+Top 15 biomarkers important in classifying vaccinees by developing either no qualifying diarrhea or mild to severe diarrhea following V. cholerae challenge on day 10 **A)** or day 90 **B)**. Biomarkers were selected using serum collected from participants on the day of challenge. Biomarkers are ranked by importance scores calculated using conditional random forest classification models.
+
+```{r}
+# day 11
+pv_d11 <- pv[group == 'Vaccinee' & day == 'D11' & challenge == 11]
+
+# day 91
+pv_d91 <- pv[group == 'Vaccinee' & day == 'D91']
+
+# call sample column sample
+setnames(pv_d11, 'sample', 'sample')
+setnames(pv_d91, 'sample', 'sample')
+```
+
+**A)**
+
+```{r figS9a, fig.width = 6, fig.height = 4}
+# data
+rf_pv <- dcast(pv_d11, sample + outcome ~ variable, value.var = 'value')
+rf_pv <- na.omit(rf_pv[, -c('sample')])
+
+# run with conditional random forest
+run_rf_analysis(rf_pv,
+                select_method = 'crf',
+                num_top_markers = 15,
+                print_rank_table = FALSE)
+```
+
+**B)**
+
+```{r figS9b, fig.width = 6, fig.height = 4}
+# data
+rf_pv <- dcast(pv_d91, sample + outcome ~ variable, value.var = 'value')
+rf_pv <- na.omit(rf_pv[, -c('sample')])
+
+# run with conditional random forest
+run_rf_analysis(rf_pv,
+                select_method = 'crf',
+                num_top_markers = 15,
+                print_rank_table = FALSE)
+```
+
+## Figure S10. Predicting whether or not vaccinees develop diarrhea following challenge on either day 10 or day 90
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying vaccinees that develop diarrhea vs. those that do not using random forest models with different subsets of biomarkers and age. "5 biomarkers" corresponds to five of the top biomarkers selected via conditional importance. For Day 10, "5 biomarkers" included vibriocidal titer, ADNP, ADCD, Sialidase IgA, and Sialidase IgA1. For Day 90, "5 biomarkers" included CT-HT IgA2, Inaba-OSP IgA2, CtxB IgA, CT-HT IgA, and CtxB IgM. True and false positive rates calcualted using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r day-11-roc, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  pv_res <- lapply(list('all', 'top5', 'IgA_rCtxB', 'ADCD', 'IgA2_CTHT',
+                        'IgA_TcpA', 'vibinab', 'IgG3_InabaOSPBSA'),
+                   loo_crf,
+                   indat = pv_d11,
+                   outcome_name = 'outcome',
+                   include_age = TRUE)
+  
+  pv_res <- rbindlist(pv_res, use.names = TRUE)
+  
+  # save results
+  write.csv(pv_res, here::here('cv_results/public_pv_d11_cv_wts_results_20220302.csv'))
+  
+} else {
+  
+  # load saved results
+  pv_res <- fread(here::here('cv_results/public_pv_d11_cv_wts_results_20220302.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       diapos_correct = 0,
+                       all_correct = 0,
+                       outcome_name = NA)
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_d11[outcome==0, sample])
+
+# loop over models we ran
+for (i in unique(pv_res$biomarkers)) {
+  # subset to model
+  model_res <- pv_res[biomarkers==i]
+  # get porportion of the individuals with diarrhea that were correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               diapos_correct = diapos,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day 11'))
+}
+```
+
+```{r day-91-roc, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  pv_res <- lapply(list('all', 'top5', 'IgA_rCtxB', 'ADCD', 'IgA2_CTHT',
+                        'IgA_TcpA', 'vibinab', 'IgG3_InabaOSPBSA'),
+                   loo_crf,
+                   indat = pv_d91,
+                   outcome_name = 'outcome',
+                   include_age = TRUE)
+  
+  pv_res <- rbindlist(pv_res, use.names = TRUE)
+  
+  # save results
+  write.csv(pv_res, here::here('cv_results/public_pv_d91_cv_wts_results_20211229.csv'))
+  
+} else {
+  
+  # load saved results
+  pv_res <- fread(here::here('cv_results/public_pv_d91_cv_wts_results_20211229.csv'))
+}
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_d91[outcome==0, sample])
+
+# loop over models we ran
+for (i in unique(pv_res$biomarkers)) {
+  # subset to model
+  model_res <- pv_res[biomarkers==i]
+  # get porportion of the individuals with diarrhea that were correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               diapos_correct = diapos,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day 91'))
+}
+
+# clean up for plotting
+markers <- c('all', 'top5', 'ADCD', 'IgA_TcpA', 
+             'IgA2_CTHT', 'IgA_rCtxB', 'vibinab')
+marker_labels <- c('All biomarkers', 'Top 5', 'ADCD', 'anti-TcpA IgA', 
+                   'anti-CTHT IgA2', 'anti-CtxB IgA', 'Vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+res_vals[, outcome_name := factor(outcome_name, 
+                                  levels = c('Day of challenge', 'Day 11', 'Day 91'))]
+```
+
+```{r figS10, fig.width = 8, fig.height = 7}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  facet_wrap('outcome_name', nrow = 1) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  facet_wrap('outcome_name', nrow = 1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 2, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+## Figure S11. Predicting whether or not vaccinees develop diarrhea using fold increase in vibriocidal titers
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying vaccinees that develop diarrhea vs. those that do not using conditional random forest models with different vibriocidal titer measurements and age. True and false positive rates calcualted using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+# add column with binary
+pv_vibfold <- copy(pv_dchal)
+pv_vibfold <- pv_vibfold[variable == 'vibinab']
+pv_vibfold[, vib4fold := ifelse(vib_fold >=4, 1, 0)]
+setnames(pv_vibfold, 'value', 'vibinab')
+pv_vibfold <- melt(pv_vibfold, id.vars = c('sample', 'outcome', 'age'),
+                   measure.vars = c('vibinab', 'vib4fold', 'vib_fold'))
+pv_vibfold <- unique(pv_vibfold)
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  pv_res <- lapply(list('vibinab', 'vib_fold', 'vib4fold'),
+                   loo_crf,
+                   indat = pv_vibfold,
+                   outcome_name = 'outcome',
+                   include_age = TRUE)
+  
+  pv_res <- rbindlist(pv_res, use.names = TRUE)
+  
+  # save results
+  write.csv(pv_res, here::here('cv_results/public_pv_vibfold_cv_wts_results_20220308.csv'))
+  
+} else {
+  
+  # load saved results
+  pv_res <- fread(here::here('cv_results/public_pv_vibfold_cv_wts_results_20220308.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       diapos_correct = 0,
+                       all_correct = 0,
+                       outcome_name = NA)
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_dchal[outcome==0, sample])
+
+# loop over models we ran
+for (i in unique(pv_res$biomarkers)) {
+  # subset to model
+  model_res <- pv_res[biomarkers==i]
+  # get porportion of the individuals with diarrhea that were correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               diapos_correct = diapos,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day of challenge'))
+}
+
+# clean up
+res_vals <- res_vals[-1,]
+res_vals[, model := sapply(res_vals$model, format_biomarker)]
+```
+
+```{r figS11, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 3, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.7, 0.25),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 3, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+## Figure S12. Predicting whether or not vaccinees develop diarrhea using an ensemble of machine learning models
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying vaccinees that develop diarrhea vs. those that do not using an ensemble of three machine-learning models: random forest, penalized logistic regression, and support vector machine. Models were run with different subsets of biomarkers measured in serum on the day of challenge and age. "5 biomarkers" corresponds to five of the top biomarkers selected via conditional importance, including CT-HT IgA, CT-HT IgA2, CtxB IgA, TcpA IgA, and Inaba-OSP IgG3. True and false positive rates calcualted using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r, message = FALSE, warning = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # make sure we have seed set up for parallel processing
+  RNGkind("L'Ecuyer-CMRG")
+  set.seed(3405)
+  # run analysis for each different set of biomarkers
+  pv_res <- mclapply(list('ADCD', 'IgA_rCtxB', 'IgA2_CTHT',
+                        'IgA_TcpA', 'vibinab',
+                        'all', 'top5'),
+                   loo_ensemble,
+                   data = pv_dchal,
+                   outcome_name = 'outcome',
+                   include_age = TRUE,
+                   mc.cores = 7)
+  
+  pv_res <- rbindlist(pv_res, use.names = TRUE)
+  
+  # save results
+  write.csv(pv_res, here::here('cv_results/public_pv_dchal_cv_wts_ensemble_20220119.csv'))
+  
+} else {
+  
+  # load saved results
+  pv_res <- fread(here::here('cv_results/public_pv_dchal_cv_wts_ensemble_20220119.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       diapos_correct = 0,
+                       all_correct = 0,
+                       outcome_name = NA)
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_dchal[outcome==0, sample])
+
+# loop over models we ran
+for (i in unique(pv_res$biomarkers)) {
+  # subset to model
+  model_res <- pv_res[biomarkers==i]
+  # get porportion of the individuals with diarrhea that were correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               diapos_correct = diapos,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day of challenge'))
+}
+
+# clean up for plotting
+markers <- c('all', 'top5', 'ADCD', 'IgA_TcpA', 
+             'IgA2_CTHT', 'IgA_rCtxB', 'vibinab')
+marker_labels <- c('All biomarkers', '5 biomarkers', 'ADCD', 'TcpA IgA', 
+                   'CT-HT IgA2', 'CtxB IgA', 'Vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+```
+
+```{r figS12, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.75, 0.28),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+## Figure S13. Predicting infection outcome among household contacts using models fit with vaccinee data and vice versa
+
+**A)** Cross-prediction cross-validated receiver operator curves (cvROC). "Contacts predicted with vaccinees" indicates predicting whether household contacts remained uninfected vs. became infected using the "5 biomarkers" random forest model fit with the vaccinee data (biomarkers included ADCD, CtxB IgM, TcpA IgG2, Ogawa-OSP IgG1, and Sialidase IgG1). "Vaccinees predicted with contacts" indicates predicting whether or not vaccinees develop diarrhea using the "5 biomarkers" random forest model fit with the household contacts data (biomarkers included CT-HT IgA, CtxB IgA, CT-HT IgA2, TcpA IgA, and Sialidase IgA2). True and false positive rates calculated using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r cross-pred-vax, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+# make biomarker names consistent between datasets
+pv_dchal$variable_clean <- sapply(pv_dchal$variable, format_biomarker)
+dt$variable_clean <- sapply(dt$variable, format_biomarker)
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  cp_res <- cross_pred(variables = c('CT-HT IgA', 'CtxB IgA', 'CT-HT IgA2', 
+                                     'TcpA IgA', 'Sialidase IgA'),
+                       train_dat = pv_dchal,
+                       test_dat = dt,
+                       train_outcome = 'outcome',
+                       test_outcome = 'stoolneg',
+                       include_age = TRUE)
+  
+  # save results
+  write.csv(cp_res, here::here('cv_results/public_cross_pred_contacts_20220601.csv'))
+  
+} else {
+  
+  # load saved results
+  cp_res <- fread(here::here('cv_results/public_cross_pred_contacts_20220601.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       npv = 0,
+                       ppv = 0,
+                       all_correct = 0,
+                       outcome_name = NA)
+
+# ids for actual outcomes
+stoolpos_ids <- dt_wide[category1!='uninfected', sample]
+stoolneg_ids <- dt_wide[category1=='uninfected', sample]
+
+# loop over models we ran
+for (i in unique(cp_res$biomarkers)) {
+  # subset to model
+  model_res <- cp_res[biomarkers==i]
+  # get porportion of the samples that were correctly classified
+  tmp <- model_res[sample %in% stoolpos_ids]
+  stlpos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  tmp <- model_res[sample %in% stoolneg_ids]
+  stlneg <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<30, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               npv = stlpos,
+                               ppv = stlneg,
+                               outcome_name = 'Uninfected vs. Infected'))
+}
+```
+
+```{r cross-pred-contacts, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  cp_res <- cross_pred(variables = c('ADCD', 'CtxB IgM', 'TcpA IgG2', 
+                                     'Ogawa-OSP IgG1', 'Sialidase IgG1'),
+                       train_dat = dt,
+                       test_dat = pv_dchal,
+                       train_outcome = 'stoolneg',
+                       test_outcome = 'outcome',
+                       include_age = TRUE)
+  
+  # save results
+  write.csv(cp_res, here::here('cv_results/public_cross_pred_vax_20220601.csv'))
+  
+} else {
+  
+  # load saved results
+  cp_res <- fread(here::here('cv_results/public_cross_pred_vax_20220601.csv'))
+}
+
+# get ids for those that had diarrhea
+diapos_ids <- unique(pv_dchal[outcome==0, sample])
+dianeg_ids <- unique(pv_dchal[outcome==1, sample])
+
+# loop over models we ran
+for (i in unique(cp_res$biomarkers)) {
+  # subset to model
+  model_res <- cp_res[biomarkers==i]
+  # get porportion of the individuals correctly classified
+  tmp <- model_res[sample %in% diapos_ids]
+  diapos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  tmp <- model_res[sample %in% dianeg_ids]
+  dianeg <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<20, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               npv = diapos,
+                               ppv = dianeg,
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               outcome_name = 'Day of challenge'))
+}
+
+# clean up for plotting
+markers <- c('Uninfected vs. Infected', 'Day of challenge')
+marker_labels <- c('Contacts predicted with vaccinees', 
+                   'Vaccinees predicted with contacts')
+res_vals <- res_vals[outcome_name %in% markers]
+for (i in 1:length(markers)) res_vals[outcome_name==markers[i], 
+                                      outcome_name := marker_labels[i]]
+res_vals[, outcome_name := factor(outcome_name, levels = marker_labels)]
+```
+
+```{r}
+# format "best" mods for this plot
+markers <- c('Uninfected vs. Infected', 'Day of challenge')
+marker_labels <- c('Contacts predicted with contacts', 
+                   'Vaccinees predicted with vaccinees')
+best_mods <- best_mods[outcome_name %in% markers]
+for (i in 1:length(markers)) best_mods[outcome_name==markers[i], 
+                                      outcome_name := marker_labels[i]]
+best_mods[, outcome_name := factor(outcome_name, levels = marker_labels)]
+
+# add in original model results to serve as a "control"
+res_vals <- rbind(res_vals, best_mods)
+
+# set order
+res_vals[, outcome_name := factor(outcome_name, levels = c('Contacts predicted with contacts',
+                                                           'Contacts predicted with vaccinees',
+                                                           'Vaccinees predicted with vaccinees',
+                                                           'Vaccinees predicted with contacts'))]
+```
+
+```{r figS13, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = outcome_name, group = outcome_name)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 10, name = 'Paired')[7:10],
+                     name = NULL) +
+  theme_classic() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.7, 0.2),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = outcome_name, y = auc, color = outcome_name)) +
+  geom_errorbar(aes(x = outcome_name, ymin = auc_lower, ymax = auc_upper, 
+                    color = outcome_name),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 10, name = 'Paired')[7:10],
+                     name = NULL) +
+  theme_classic() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  # wrap x axis labels
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  theme(legend.position = 'none')  -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
+## Figure S14. Comparison of original vibriocidal titer responses to new vibriocidal titers in household contacts of index cholera cases
+
+Vibriocidal antibody titers for the subset (n = 252) of samples for which there was sufficient sample remaining to re-run the vibriocidal antibody assays. Purple line shows a 1:1 relationship and the size of each point corresponds to the number of samples that fell at each point on the graph.
+
+```{r figS14, fig.width = 5.5, fig.height = 4}
+# correlation
+dt_cor <- na.omit(dt_wide[, c('vibogaw', 'Ogvctiter2_new_titers')])
+
+ct <- cor.test(dt_cor$vibogaw, dt_cor$Ogvctiter2_new_titers,
+               method = 'spearman')
+
+# plot
+ggplot(dt_wide, aes(y=vibogaw, x = Ogvctiter2_new_titers)) +
+  geom_count() +
+  scale_y_continuous(trans='log2') +
+  scale_x_continuous(trans='log2') +
+  geom_abline(slope = 1, intercept = 0, color = 'purple') +
+  theme_bw() +
+  annotate('text', x = 20, y = 3000, color = 'darkgreen',
+           label = paste0('Spearman rho = ', signif(ct$estimate, 2))) +
+  labs(y = 'Original vibriocidal titers', x = 'New vibriocidal titers')
+```
+
+## Figure S15. Predicting stool culture status using old and new vibriocidal titers from the household contacts of index cholera cases
+
+**A)** Cross-validated receiver operator curves (cvROC) for classifying household contacts as uninfected vs. infected based on old and new vibriocidal antibody titers and age. Analysis includes the subset (n = 252) of samples for which there was sufficient sample remaining to re-run the vibriocidal antibody assays. True and false positive rates calcualted using leave-one-out cross-validation. **B)** Cross-validated area under the curve (cvAUC) corresponding to the models in A. Influence-curve based 95% confidence intervals are shown for the cvAUC estimates. 
+
+```{r, message = FALSE}
+# whether or not to re-run cross-validation
+rerun_cv <- FALSE
+
+# set just two variables for old and new vibriocidals
+dt_newvib[variable=='ADNP_PS', value := vibogaw]
+dt_newvib[variable=='ADNP_PS', variable := 'vibogaw']
+dt_newvib <- dt_newvib[variable %in% c('vibogaw', 'Ogvctiter2_new_titers')]
+
+# omit samples that are missing new vibriocidals
+message('Dropping 9 of 261 samples (3%) that are missing new vibriocidal titers')
+keep_ids <- dt_newvib[!is.na(value) & variable=='Ogvctiter2_new_titers', sample]
+dt_newvib <- dt_newvib[sample %in% keep_ids]
+
+if (rerun_cv) {
+  # run analysis for each different set of biomarkers
+  original_res <- lapply(list('vibogaw', 'Ogvctiter2_new_titers'),
+                         loo_crf,
+                         indat = dt_newvib,
+                         outcome_name = 'stoolneg',
+                         include_age = TRUE)
+  
+  original_res <- rbindlist(original_res, use.names = TRUE)
+  
+  # save results
+  write.csv(original_res, here::here('cv_results/public_newvib_cv_20211229.csv'))
+} else {
+  
+  # load saved results
+  original_res <- fread(here::here('cv_results/public_newvib_cv_20211229.csv'))
+}
+
+# get sensitivities, specificities, and AUC for each and plot
+res_vals <- data.table(model = NA,
+                       fp = 0, tp = 0,
+                       auc = 0, auc_upper = 0, auc_lower = 0,
+                       all_correct = 0,
+                       npv = 0,
+                       outcome_name = NA)
+
+# ids for uninfected samples
+stoolpos_ids <- dt_wide[category1!='uninfected', sample]
+
+# loop over models we ran
+for (i in unique(original_res$biomarkers)) {
+  # subset to model
+  model_res <- original_res[biomarkers==i]
+  # get porportion of the unkown samples (uninfected) that were correctly classified
+  tmp <- model_res[sample %in% stoolpos_ids]
+  stlpos <- sum(tmp$outcome_value == tmp$prediction)/nrow(tmp)
+  # get roc values
+  rocobj <- roc(model_res$outcome_value, as.numeric(model_res$prob1))
+  # get AUC values
+  aucvals <- ci.pooled.cvAUC(as.numeric(model_res$prob1), 
+                             model_res$outcome_value, 
+                             ids = model_res$sample)
+  # adjust AUC vals if comparison is control > cases
+  if (rocobj$direction == '>') {
+    aucvals$cvAUC <- (1 - as.numeric(aucvals$cvAUC))
+    aucvals$ci[[1]] <- (1 - as.numeric(aucvals$ci[[1]]))
+    aucvals$ci[[2]] <- (1 - as.numeric(aucvals$ci[[2]]))
+  }
+  # add to table
+  res_vals <- rbind(res_vals, 
+                    data.table(model = ifelse(nchar(i)<30, i, 'top5'),
+                               fp = 1-as.numeric(rocobj$sensitivities),
+                               tp = as.numeric(rocobj$specificities),
+                               auc = as.numeric(aucvals$cvAUC),
+                               auc_upper = as.numeric(aucvals$ci[[1]]),
+                               auc_lower = as.numeric(aucvals$ci[[2]]),
+                               all_correct = sum(model_res$outcome_value == model_res$prediction)/nrow(model_res),
+                               npv = stlpos,
+                               outcome_name = 'Old vs. new vibriocidal titers'))
+}
+
+# clean up for plotting
+markers <- c('vibogaw', 'Ogvctiter2_new_titers')
+marker_labels <- c('Original vibriocidal titer', 'New vibriocidal titer')
+res_vals <- res_vals[model %in% markers]
+for (i in 1:length(markers)) res_vals[model==markers[i], model := marker_labels[i]]
+res_vals[, model := factor(model, levels = marker_labels)]
+```
+
+```{r figS15, fig.width = 8, fig.height = 3.6}
+# make ROC curve plots
+ggplot(res_vals, aes(x = fp, y = tp, color = model, group = model)) +
+  geom_line(size = 0.6) +
+  labs(y = 'True positive rate (sensitivity)', 
+       x = 'False positive rate (1 - specificity)') +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  geom_abline(slope = 1, intercept = 0, color = 'grey45') +
+  theme(legend.position = c(0.3, 0.85),
+        legend.background = element_blank(),
+        legend.key = element_blank()) -> p1
+
+# make cvAUC plots
+plot_auc <- unique(res_vals[, c('outcome_name', 'model', 'auc', 'auc_lower', 'auc_upper')])
+
+ggplot(plot_auc) +
+  geom_point(aes(x = model, y = auc, color = model)) +
+  geom_errorbar(aes(x = model, ymin = auc_lower, ymax = auc_upper, color = model),
+                width = 0.25) +
+  scale_color_manual(values = brewer.pal(n = 7, name = 'Dark2'),
+                     name = NULL) +
+  theme_bw() +
+  ylim(c(0,1)) +
+  labs(x = NULL, y = 'cvAUC') +
+  theme(legend.position = 'none') -> p2
+
+# plot
+cowplot::plot_grid(p1, p2, nrow = 1, 
+                   labels = c('A', 'B'),
+                   rel_heights = c(0.9, 1))
+```
+
