@@ -1,2 +1,2 @@
-# cholera-systems-serology
-A systems serology analysis of correlates of protection against cholera
+## Source code and data for _A systems serology analysis of correlates of protection against cholera_ 
+#### Kirsten E. Wiens, Anita S. Iyer, Taufiqur R. Bhuiyan, Lenette L. Lu, Deniz Cizmeci, Matthew J. Gorman, Dansu Yuan, Rachel L. Becker, Edward T. Ryan, Stephen B. Calderwood, Regina C. LaRocque, Fahima Chowdhury, Ashraful I. Khan, Myron M. Levine, Wilbur H. Chen, Richelle C. Charles, Andrew S. Azman, Firdausi Qadri, Galit Alter, Jason B. Harris
